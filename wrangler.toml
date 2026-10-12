@@ -1,0 +1,11 @@
+name = "watch-engine"
+main = "src/index.js"
+compatibility_date = "2026-10-08"
+
+[[kv_namespaces]]
+binding = "WATCH_KV"
+id = "021f939116ae416bb35703daa1e2c74d"
+preview_id = "REPLACE_WITH_KV_ID"
+
+[triggers]
+crons = ["0 6 * * *"]
