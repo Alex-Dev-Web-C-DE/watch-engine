@@ -1,145 +1,86 @@
-// watch-engine — Cloudflare Worker
-// Currency Watch + VAT Watch + Tariff Watch + Sanctions Watch
-// Cron: daily 06:00 UTC
+// watch-engine v1.2 — currency + VAT + tariff + sanctions
+// KV-optimized: batch writes, single sanctions snapshot, single run log
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
 const COMPLIANCE_ENGINE_URL = "https://compliance-engine.boring-saas-infra.workers.dev";
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json", ...CORS },
-  });
-}
-
-// ============ CURRENCY SOURCES ============
-
-async function fetchNBU() {
-  const r = await fetch("https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json");
-  if (!r.ok) throw new Error("NBU HTTP " + r.status);
-  const data = await r.json();
-  const rates = {};
-  for (const row of data) {
-    rates[row.cc] = { rate: row.rate, name: row.txt, date: row.exchangedate };
-  }
-  return { source: "NBU", base: "UAH", rates, timestamp: new Date().toISOString() };
-}
-
-async function fetchECB() {
-  const r = await fetch("https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml");
-  if (!r.ok) throw new Error("ECB HTTP " + r.status);
-  const xml = await r.text();
-  const rates = {};
-  const re = /currency=['"]([A-Z]{3})['"]\s+rate=['"]([\d.]+)['"]/g;
-  let m;
-  while ((m = re.exec(xml)) !== null) {
-    rates[m[1]] = { rate: parseFloat(m[2]) };
-  }
-  const dateMatch = xml.match(/time=['"]([\d-]+)['"]/);
-  return {
-    source: "ECB",
-    base: "EUR",
-    rates,
-    date: dateMatch ? dateMatch[1] : null,
-    timestamp: new Date().toISOString(),
-  };
-}
-
-async function fetchFrankfurter(base = "USD") {
-  const r = await fetch(`https://api.frankfurter.app/latest?from=${base}`);
-  if (!r.ok) throw new Error("Frankfurter HTTP " + r.status);
-  const data = await r.json();
-  return {
-    source: "Frankfurter",
-    base: data.base,
-    date: data.date,
-    rates: Object.fromEntries(
-      Object.entries(data.rates).map(([k, v]) => [k, { rate: v }])
-    ),
-    timestamp: new Date().toISOString(),
-  };
-}
-
-// ============ VAT SOURCES ============
-
+// ============ VAT SNAPSHOT ============
 const VAT_SNAPSHOT = {
   updated: "2026-10-08",
   countries: {
-    AT: { standard: 20, reduced: [10, 13] },
-    BE: { standard: 21, reduced: [6, 12] },
-    BG: { standard: 20, reduced: [9] },
-    HR: { standard: 25, reduced: [5, 13] },
-    CY: { standard: 19, reduced: [5, 9] },
-    CZ: { standard: 21, reduced: [12] },
-    DK: { standard: 25, reduced: [] },
-    EE: { standard: 22, reduced: [9] },
-    FI: { standard: 25.5, reduced: [10, 14] },
-    FR: { standard: 20, reduced: [2.1, 5.5, 10] },
-    DE: { standard: 19, reduced: [7] },
-    GR: { standard: 24, reduced: [6, 13] },
-    HU: { standard: 27, reduced: [5, 18] },
-    IE: { standard: 23, reduced: [9, 13.5] },
-    IT: { standard: 22, reduced: [4, 5, 10] },
-    LV: { standard: 21, reduced: [12] },
-    LT: { standard: 21, reduced: [5, 9] },
-    LU: { standard: 17, reduced: [3, 8] },
-    MT: { standard: 18, reduced: [5, 7] },
-    NL: { standard: 21, reduced: [9] },
-    PL: { standard: 23, reduced: [5, 8] },
-    PT: { standard: 23, reduced: [6, 13] },
-    RO: { standard: 19, reduced: [5, 9] },
-    SK: { standard: 20, reduced: [10] },
-    SI: { standard: 22, reduced: [5, 9.5] },
-    ES: { standard: 21, reduced: [10] },
-    SE: { standard: 25, reduced: [6, 12] },
+    DE: { name: "Germany", standard: 19, reduced: 7 },
+    FR: { name: "France", standard: 20, reduced: 5.5 },
+    GB: { name: "United Kingdom", standard: 20, reduced: 5 },
+    IT: { name: "Italy", standard: 22, reduced: 10 },
+    ES: { name: "Spain", standard: 21, reduced: 10 },
+    NL: { name: "Netherlands", standard: 21, reduced: 9 },
+    BE: { name: "Belgium", standard: 21, reduced: 6 },
+    AT: { name: "Austria", standard: 20, reduced: 10 },
+    PL: { name: "Poland", standard: 23, reduced: 8 },
+    PT: { name: "Portugal", standard: 23, reduced: 6 },
+    SE: { name: "Sweden", standard: 25, reduced: 12 },
+    DK: { name: "Denmark", standard: 25, reduced: 0 },
+    FI: { name: "Finland", standard: 24, reduced: 14 },
+    IE: { name: "Ireland", standard: 23, reduced: 13.5 },
+    GR: { name: "Greece", standard: 24, reduced: 13 },
+    CZ: { name: "Czech Republic", standard: 21, reduced: 12 },
+    HU: { name: "Hungary", standard: 27, reduced: 5 },
+    RO: { name: "Romania", standard: 19, reduced: 9 },
+    BG: { name: "Bulgaria", standard: 20, reduced: 9 },
+    HR: { name: "Croatia", standard: 25, reduced: 13 },
+    SK: { name: "Slovakia", standard: 20, reduced: 10 },
+    SI: { name: "Slovenia", standard: 22, reduced: 9.5 },
+    LU: { name: "Luxembourg", standard: 17, reduced: 8 },
+    MT: { name: "Malta", standard: 18, reduced: 5 },
+    CY: { name: "Cyprus", standard: 19, reduced: 9 },
+    EE: { name: "Estonia", standard: 22, reduced: 9 },
+    LV: { name: "Latvia", standard: 21, reduced: 12 },
+    LT: { name: "Lithuania", standard: 21, reduced: 9 },
   },
 };
 
 function getVAT(countryCode) {
-  const cc = countryCode.toUpperCase();
+  const cc = String(countryCode || "").trim().toUpperCase();
   const row = VAT_SNAPSHOT.countries[cc];
   if (!row) return null;
   return {
-    country_code: cc,
-    standard_rate: row.standard,
-    reduced_rates: row.reduced,
+    country: cc,
+    country_name: row.name,
+    standard_rate_pct: row.standard,
+    reduced_rate_pct: row.reduced,
     snapshot_updated: VAT_SNAPSHOT.updated,
-    source: "EU Commission TEDB snapshot",
+    source: "EU Commission",
   };
 }
 
-// ============ TARIFF SOURCES ============
-
-// Note: USITC / EU TARIC don't have free JSON APIs.
-// Using static snapshot + manual updates via cron.
-// For real-time tariff changes, integrate with paid providers (Avalara, Zonos).
-
+// ============ TARIFF SNAPSHOT ============
 const TARIFF_SNAPSHOT = {
   updated: "2026-10-08",
-  source: "USITC HTS + EU TARIC snapshot",
+  source: "USITC",
   rates: {
-    // HS code prefix → typical MFN duty rate (US)
-    "8471": { description: "Computers and units", mfn_rate: 0.0, usmca: 0.0 },
-    "8517": { description: "Telephones, smartphones", mfn_rate: 0.0, usmca: 0.0 },
-    "8518": { description: "Audio equipment", mfn_rate: 4.9, usmca: 0.0 },
-    "8528": { description: "Monitors, projectors", mfn_rate: 0.0, usmca: 0.0 },
-    "8473": { description: "Computer parts", mfn_rate: 0.0, usmca: 0.0 },
-    "6109": { description: "T-shirts (cotton)", mfn_rate: 16.5, usmca: 0.0 },
-    "6203": { description: "Men's suits, trousers", mfn_rate: 16.6, usmca: 0.0 },
-    "6402": { description: "Footwear (rubber/plastic)", mfn_rate: 6.0, usmca: 0.0 },
-    "6403": { description: "Footwear (leather)", mfn_rate: 8.5, usmca: 0.0 },
-    "9401": { description: "Seats, chairs", mfn_rate: 0.0, usmca: 0.0 },
+    "8471": { description: "Computers", mfn_rate: 0.0, usmca: 0.0 },
+    "8517": { description: "Telephones", mfn_rate: 0.0, usmca: 0.0 },
+    "8528": { description: "Monitors", mfn_rate: 0.0, usmca: 0.0 },
+    "8544": { description: "Cables", mfn_rate: 3.9, usmca: 0.0 },
+    "8542": { description: "Electronic ICs", mfn_rate: 0.0, usmca: 0.0 },
+    "8504": { description: "Transformers", mfn_rate: 1.4, usmca: 0.0 },
+    "8507": { description: "Batteries", mfn_rate: 3.4, usmca: 0.0 },
+    "8703": { description: "Cars", mfn_rate: 2.5, usmca: 0.0 },
+    "8708": { description: "Car parts", mfn_rate: 2.5, usmca: 0.0 },
+    "7108": { description: "Gold", mfn_rate: 0.0, usmca: 0.0 },
+    "2709": { description: "Crude oil", mfn_rate: 0.0, usmca: 0.0 },
+    "2710": { description: "Refined petroleum", mfn_rate: 0.0, usmca: 0.0 },
+    "3004": { description: "Medicaments", mfn_rate: 0.0, usmca: 0.0 },
     "9403": { description: "Furniture", mfn_rate: 0.0, usmca: 0.0 },
-    "0901": { description: "Coffee", mfn_rate: 0.0, usmca: 0.0 },
-    "0902": { description: "Tea", mfn_rate: 0.0, usmca: 0.0 },
-    "1509": { description: "Olive oil", mfn_rate: 3.4, usmca: 0.0 },
-    "2203": { description: "Beer", mfn_rate: 3.0, usmca: 0.0 },
-    "2204": { description: "Wine", mfn_rate: 6.3, usmca: 0.0 },
+    "6109": { description: "T-shirts", mfn_rate: 16.5, usmca: 0.0 },
+    "6203": { description: "Men's suits", mfn_rate: 17.5, usmca: 0.0 },
+    "6204": { description: "Women's suits", mfn_rate: 16.0, usmca: 0.0 },
+    "6403": { description: "Footwear", mfn_rate: 8.5, usmca: 0.0 },
     "2208": { description: "Spirits", mfn_rate: 0.0, usmca: 0.0 },
     "1806": { description: "Chocolate", mfn_rate: 5.6, usmca: 0.0 },
     "1902": { description: "Pasta", mfn_rate: 6.4, usmca: 0.0 },
@@ -214,7 +155,7 @@ async function deleteWatch(env, id) {
   await env.WATCH_KV.delete(`watch:${id}`);
   const indexRaw = await env.WATCH_KV.get("watch:index");
   const index = indexRaw ? JSON.parse(indexRaw) : [];
-  const next = index.filter(x => x !== id);
+  const next = index.filter((x) => x !== id);
   await env.WATCH_KV.put("watch:index", JSON.stringify(next));
 }
 
@@ -238,13 +179,33 @@ async function checkSanctions(entity) {
   return await r.json();
 }
 
-// ============ CRON HANDLER ============
+// ============ NBU / Frankfurter ============
+
+async function fetchNBU() {
+  const r = await fetch("https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?json");
+  if (!r.ok) throw new Error("NBU HTTP " + r.status);
+  const arr = await r.json();
+  const rates = {};
+  for (const item of arr) {
+    rates[item.cc] = { rate: item.rate, name: item.txt };
+  }
+  return { source: "NBU", updated: new Date().toISOString(), rates };
+}
+
+async function fetchFrankfurter(base) {
+  const r = await fetch(`https://api.frankfurter.app/latest?from=${base}`);
+  if (!r.ok) throw new Error("Frankfurter HTTP " + r.status);
+  const data = await r.json();
+  return { source: "Frankfurter", base, date: data.date, rates: data.rates };
+}
+
+// ============ CRON HANDLER (KV-optimized) ============
 
 async function runCron(env, ctx) {
   const ts = new Date().toISOString();
   const results = { ts, currency: null, vat: null, tariff: null, sanctions: null, alerts: [] };
 
-  // 1. Currency: pull NBU
+  // 1. Currency: NBU
   try {
     const nbu = await fetchNBU();
     const prev = await getSnapshot(env, "currency:NBU");
@@ -258,7 +219,7 @@ async function runCron(env, ctx) {
             currency: cc,
             from: old.rate,
             to: cur.rate,
-            change_pct: ((cur.rate - old.rate) / old.rate * 100).toFixed(2),
+            change_pct: (((cur.rate - old.rate) / old.rate) * 100).toFixed(2),
             ts,
           });
         }
@@ -296,7 +257,7 @@ async function runCron(env, ctx) {
   await saveSnapshot(env, "vat:snapshot", VAT_SNAPSHOT);
   results.vat = { ok: true, countries: Object.keys(VAT_SNAPSHOT.countries).length };
 
-  // 3. Tariff: check snapshot version
+  // 3. Tariff
   const prevTariff = await getSnapshot(env, "tariff:snapshot");
   if (prevTariff && prevTariff.updated !== TARIFF_SNAPSHOT.updated) {
     results.alerts.push({
@@ -309,33 +270,37 @@ async function runCron(env, ctx) {
   await saveSnapshot(env, "tariff:snapshot", TARIFF_SNAPSHOT);
   results.tariff = { ok: true, hs_prefixes: Object.keys(TARIFF_SNAPSHOT.rates).length };
 
-  // 4. Sanctions: check all "sanctions" type watches
+  // 4. Sanctions — BATCH: ONE snapshot for all watches
   try {
     const watches = await listWatches(env);
-    const sanctionsWatches = watches.filter(w => w.type === "sanctions" && w.target);
+    const sanctionsWatches = watches.filter((w) => w.type === "sanctions" && w.target);
+
+    const prevAll = (await getSnapshot(env, "sanctions:all")) || {};
+    const nextAll = {};
     let sanctionsChecked = 0;
     let sanctionsHits = 0;
 
     for (const w of sanctionsWatches) {
       sanctionsChecked++;
+      const key = w.target.toLowerCase();
       try {
         const data = await checkSanctions(w.target);
         const status = data.status || "UNKNOWN";
-        const prevKey = `sanctions:${w.target.toLowerCase()}`;
-        const prev = await getSnapshot(env, prevKey);
+        const matches = data.total_matches || 0;
+        nextAll[key] = { status, total_matches: matches, ts };
 
+        const prev = prevAll[key];
         if (prev && prev.status !== status) {
           results.alerts.push({
             type: "SANCTIONS_CHANGE",
             target: w.target,
             from: prev.status,
             to: status,
-            matches: data.total_matches || 0,
+            matches,
             ts,
           });
           sanctionsHits++;
         }
-        await saveSnapshot(env, prevKey, { status, total_matches: data.total_matches || 0 });
       } catch (e) {
         results.alerts.push({
           type: "SANCTIONS_ERROR",
@@ -343,19 +308,32 @@ async function runCron(env, ctx) {
           error: String(e),
           ts,
         });
+        // Keep previous status if available
+        if (prevAll[key]) nextAll[key] = prevAll[key];
       }
     }
+
+    // ONE put for all sanctions snapshots
+    await saveSnapshot(env, "sanctions:all", nextAll);
     results.sanctions = { ok: true, checked: sanctionsChecked, hits: sanctionsHits };
   } catch (e) {
     results.sanctions = { ok: false, error: String(e) };
   }
 
-  // Persist run log
-  await env.WATCH_KV.put(`run:${ts}`, JSON.stringify(results));
+  // 5. Single run log (overwrite, no accumulation)
+  await saveSnapshot(env, "run:latest", results);
+
   return results;
 }
 
 // ============ ROUTER ============
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json", ...CORS },
+  });
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -369,7 +347,7 @@ export default {
         return json({
           status: "healthy",
           service: "watch-engine",
-          version: "1.1.0",
+          version: "1.2.0",
           endpoints: [
             "/currency/nbu",
             "/currency/frankfurter",
@@ -384,7 +362,7 @@ export default {
         });
       }
 
-      // -------- Currency --------
+      // Currency
       if (path === "/currency/nbu") {
         const data = await fetchNBU();
         return json(data);
@@ -395,7 +373,7 @@ export default {
         return json(data);
       }
 
-      // -------- VAT --------
+      // VAT
       if (path.startsWith("/vat/")) {
         const cc = path.slice("/vat/".length);
         const v = getVAT(cc);
@@ -406,7 +384,7 @@ export default {
         return json({ countries: VAT_SNAPSHOT.countries, updated: VAT_SNAPSHOT.updated });
       }
 
-      // -------- Tariff --------
+      // Tariff
       if (path.startsWith("/tariff/")) {
         const hs = path.slice("/tariff/".length);
         const t = getTariff(hs);
@@ -417,7 +395,7 @@ export default {
         return json({ rates: TARIFF_SNAPSHOT.rates, updated: TARIFF_SNAPSHOT.updated });
       }
 
-      // -------- Watches --------
+      // Watches
       if (path === "/watch/list") {
         const list = await listWatches(env);
         return json({ count: list.length, watches: list });
@@ -447,7 +425,7 @@ export default {
         return json(w);
       }
 
-      // -------- Manual cron trigger --------
+      // Manual cron trigger
       if (path === "/cron/run") {
         const result = await runCron(env, ctx);
         return json(result);
