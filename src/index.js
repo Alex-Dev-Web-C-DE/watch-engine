@@ -172,11 +172,22 @@ async function saveSnapshot(env, key, value) {
 
 // ============ SANCTIONS CHECK (via compliance-engine) ============
 
-async function checkSanctions(entity) {
-  const url = COMPLIANCE_ENGINE_URL + "/check/sanctions?q=" + encodeURIComponent(entity);
-  const r = await fetch(url);
-  if (!r.ok) throw new Error("Compliance engine HTTP " + r.status);
-  return await r.json();
+async function checkSanctions(env, entity) {
+  try {
+    const url = "https://compliance-engine/check/sanctions?q=" + encodeURIComponent(entity) + "&threshold=0.82&limit=5";
+    // Використовуємо Service Binding (він працює всередині Cloudflare)
+    const r = await env.COMPLIANCE.fetch(url);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    
+    const data = await r.json();
+    return {
+      status: data.status || "UNKNOWN",
+      total_matches: data.total_matches || (data.results ? data.results.length : 0)
+    };
+  } catch (e) {
+    // Якщо помилка, повертаємо спеціальний статус, щоб не перезаписувати дані
+    return { status: "ERROR", total_matches: 0, error: String(e) };
+  }
 }
 
 // ============ NBU / Frankfurter ============
@@ -197,6 +208,121 @@ async function fetchFrankfurter(base) {
   if (!r.ok) throw new Error("Frankfurter HTTP " + r.status);
   const data = await r.json();
   return { source: "Frankfurter", base, date: data.date, rates: data.rates };
+}
+
+async function fetchFed(env) {
+  const apiKey = env.FRED_API_KEY;
+  if (!apiKey) throw new Error("FRED_API_KEY not configured");
+  const series = {
+    DEXUSEU: "USD/EUR", DEXUSUK: "USD/GBP", DEXJPUS: "JPY/USD",
+    DEXCHUS: "CNY/USD", DEXCAUS: "CAD/USD", DEXUSAL: "USD/AUD",
+    DEXSZUS: "CHF/USD", DEXINUS: "INR/USD", DEXKOUS: "KRW/USD",
+    DEXMXUS: "MXN/USD", DEXTHUS: "THB/USD", DEXSFUS: "ZAR/USD",
+    DEXSIUS: "SGD/USD", DEXMAUS: "MYR/USD", DEXUSNZ: "USD/NZD",
+    DEXBZUS: "BRL/USD", DEXUSHK: "USD/HKD", DEXNOUS: "NOK/USD",
+    DEXSDUS: "SEK/USD", DEXDNUS: "DKK/USD"
+  };
+  const pairs = Object.entries(series);
+  const results = await Promise.all(
+    pairs.map(async ([sid, pair]) => {
+      try {
+        const r = await fetch(
+          `https://api.stlouisfed.org/fred/series/observations?series_id=${sid}&api_key=${apiKey}&file_type=json&sort_order=desc&limit=1`
+        );
+        if (!r.ok) return null;
+        const data = await r.json();
+        const obs = data.observations && data.observations[0];
+        if (obs && obs.value && obs.value !== ".") {
+          return [pair, { rate: parseFloat(obs.value), date: obs.date }];
+        }
+        return null;
+      } catch (e) { return null; }
+    })
+  );
+  const rates = {};
+  for (const r of results) {
+    if (r) rates[r[0]] = r[1];
+  }
+  return { source: "FRED", updated: new Date().toISOString(), count: Object.keys(rates).length, rates };
+}
+async function fetchCrypto() {
+  const pairs = "XBTUSD,ETHUSD,SOLUSD,XRPUSD,ADAUSD,DOGEUSD,DOTUSD,LTCUSD,LINKUSD,AVAXUSD,UNIUSD,XLMUSD,ATOMUSD,XMRUSD,ETCUSD,NEARUSD";
+  const r = await fetch(`https://api.kraken.com/0/public/Ticker?pair=${pairs}`);
+  if (!r.ok) throw new Error("Kraken HTTP " + r.status);
+  const data = await r.json();
+  if (data.error && data.error.length) throw new Error("Kraken: " + data.error.join(","));
+  const symbolMap = {
+    XXBTZUSD: "BTC", XETHZUSD: "ETH", SOLUSD: "SOL", XRPUSD: "XRP",
+    ADAUSD: "ADA", DOGEUSD: "DOGE", DOTUSD: "DOT", XLTCZUSD: "LTC",
+    LINKUSD: "LINK", AVAXUSD: "AVAX", UNIUSD: "UNI", XXLMZUSD: "XLM",
+    ATOMUSD: "ATOM", XXMRZUSD: "XMR", XETCZUSD: "ETC", NEARUSD: "NEAR",
+    XDGUSD: "DOGE", XXRPZUSD: "XRP"
+  };
+  const rates = {};
+  for (const [key, tick] of Object.entries(data.result || {})) {
+    const base = symbolMap[key] || key.replace("ZUSD", "").replace("USD", "");
+    rates[base + "/USD"] = { rate: parseFloat(tick.c[0]) };
+  }
+  return { source: "Kraken", updated: new Date().toISOString(), count: Object.keys(rates).length, rates };
+}
+
+
+async function fetchRates() {
+  const r = await fetch("https://open.er-api.com/v6/latest/USD");
+  if (!r.ok) throw new Error("open.er-api.com HTTP " + r.status);
+  const data = await r.json();
+  const rates = {};
+  for (const [cc, rate] of Object.entries(data.rates || {})) {
+    rates["USD/" + cc] = { rate: 1/rate, inverse: rate };
+  }
+  return { source: "open.er-api.com", base: "USD", updated: data.time_last_update_utc || new Date().toISOString(), count: Object.keys(rates).length, rates };
+}
+
+async function fetchMetals() {
+  const symbols = ["XAU", "XAG", "XPT", "XPD"];
+  const results = await Promise.all(
+    symbols.map(async (sym) => {
+      try {
+        const r = await fetch(`https://api.gold-api.com/price/${sym}`);
+        if (!r.ok) return null;
+        const data = await r.json();
+        return [sym + "/USD", { rate: data.price, name: data.name, updated: data.updatedAt }];
+      } catch (e) { return null; }
+    })
+  );
+  const rates = {};
+  for (const item of results) {
+    if (item) rates[item[0]] = item[1];
+  }
+  return { source: "gold-api.com", updated: new Date().toISOString(), count: Object.keys(rates).length, rates };
+}
+
+async function fetchIndicators() {
+  const indicators = {
+    "NY.GDP.MKTP.CD": "GDP (current US$)",
+    "FP.CPI.TOTL.ZG": "Inflation (annual %)",
+    "SP.POP.TOTL": "Population"
+  };
+  const countries = ["US", "GB", "DE", "FR", "JP", "CN", "IN", "BR", "CA", "AU"];
+  const results = {};
+  for (const [code, name] of Object.entries(indicators)) {
+    const cList = countries.join(";");
+    try {
+      const r = await fetch(`https://api.worldbank.org/v2/country/${cList}/indicator/${code}?format=json&per_page=100&date=2022:2023&mrnev=1`);
+      if (!r.ok) continue;
+      const data = await r.json();
+      const values = {};
+      if (data[1]) {
+        for (const row of data[1]) {
+          if (row.value !== null) {
+            values[row.countryiso3code] = { value: row.value, year: row.date };
+          }
+        }
+      }
+      results[code] = { name, values };
+    } catch (e) { /* skip */ }
+  }
+  return { source: "World Bank", updated: new Date().toISOString(), indicators: results };
 }
 
 // ============ CRON HANDLER (KV-optimized) ============
@@ -284,7 +410,7 @@ async function runCron(env, ctx) {
       sanctionsChecked++;
       const key = w.target.toLowerCase();
       try {
-        const data = await checkSanctions(w.target);
+        const data = await checkSanctions(env, w.target);
         const status = data.status || "UNKNOWN";
         const matches = data.total_matches || 0;
         nextAll[key] = { status, total_matches: matches, ts };
@@ -351,6 +477,12 @@ export default {
           endpoints: [
             "/currency/nbu",
             "/currency/frankfurter",
+            "/currency/fed",
+            "/currency/crypto",
+
+            "/currency/rates",
+            "/commodity/metals",
+            "/economic/indicators",
             "/vat/:country",
             "/tariff/:hsCode",
             "/watch/list",
@@ -370,6 +502,27 @@ export default {
       if (path === "/currency/frankfurter") {
         const base = url.searchParams.get("base") || "USD";
         const data = await fetchFrankfurter(base);
+        return json(data);
+      }
+      if (path === "/currency/fed") {
+        const data = await fetchFed(env);
+        return json(data);
+      }
+      if (path === "/currency/crypto") {
+        const data = await fetchCrypto();
+        return json(data);
+      }
+
+      if (path === "/currency/rates") {
+        const data = await fetchRates();
+        return json(data);
+      }
+      if (path === "/commodity/metals") {
+        const data = await fetchMetals();
+        return json(data);
+      }
+      if (path === "/economic/indicators") {
+        const data = await fetchIndicators();
         return json(data);
       }
 
