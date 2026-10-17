@@ -9,3 +9,6 @@ preview_id = "REPLACE_WITH_KV_ID"
 
 [triggers]
 crons = ["0 6 * * *"]
+[[services]]
+binding = "COMPLIANCE"
+service = "compliance-engine"
